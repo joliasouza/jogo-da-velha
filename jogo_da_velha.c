@@ -255,6 +255,18 @@ void modo_jogador(int num_jogador) {
     shmdt(e);
 }
 
+/*
+COMO RODAR:
+
+gcc -o jogo jogo_da_velha.c
+./jogo servidor
+./jogo jogador 1
+./jogo jogador 2
+
+CASO QUEIRA LIMPAR OS SEMÁFOROS E MEMÓRIA COMPARTILHADA APÓS O JOGO, RODE:
+ipcrm -M 0x1234; ipcrm -S 0x5678
+*/
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Uso:\n");
