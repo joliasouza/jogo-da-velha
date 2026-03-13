@@ -105,7 +105,7 @@ void modo_servidor() {
     semctl(semid, SEM_VEZ_J2, SETVAL, 0);
     semctl(semid, SEM_INICIO, SETVAL, 0);
 
-    printf("=== SERVIDOR INICIADO ===\n");
+    printf("SERVIDOR INICIADO\n");
     printf("Aguardando Jogador 1 e Jogador 2 conectarem...\n");
     fflush(stdout);
 
@@ -155,13 +155,13 @@ void modo_servidor() {
         SEM_POST(semid, (e->turno == 1) ? SEM_VEZ_J1 : SEM_VEZ_J2);
     }
 
-    printf("===============================\n");
+    printf("\n");
     switch (e->resultado) {
         case RESULTADO_J1:     printf("  Jogador 1 (X) VENCEU!\n"); break;
         case RESULTADO_J2:     printf("  Jogador 2 (O) VENCEU!\n"); break;
         case RESULTADO_EMPATE: printf("  EMPATE!\n");                break;
     }
-    printf("===============================\n");
+    printf("\n");
 
     sleep(2);
     shmdt(e);
@@ -190,7 +190,7 @@ void modo_jogador(int num_jogador) {
     else                  e->j2_pronto = 1;
     SEM_POST(semid, SEM_MUTEX);
 
-    printf("=== Jogador %d (%c) conectado ===\n", num_jogador, simbolo);
+    printf("Jogador %d (%c) conectado\n", num_jogador, simbolo);
     printf("Aguardando o outro jogador...\n");
     fflush(stdout);
 
@@ -244,13 +244,13 @@ void modo_jogador(int num_jogador) {
     }
 
     imprimir_tabuleiro(e->tabuleiro);
-    printf("===============================\n");
+    printf("\n");
     switch (e->resultado) {
         case RESULTADO_J1:     printf("  Jogador 1 (X) VENCEU!\n"); break;
         case RESULTADO_J2:     printf("  Jogador 2 (O) VENCEU!\n"); break;
         case RESULTADO_EMPATE: printf("  EMPATE!\n");                break;
     }
-    printf("===============================\n");
+    printf("\n");
 
     shmdt(e);
 }
