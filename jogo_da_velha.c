@@ -11,18 +11,17 @@
 #define SHM_KEY          0x1234
 #define SEM_KEY          0x5678
 
-#define SEM_VEZ_J1       0
-#define SEM_VEZ_J2       1
-#define SEM_MUTEX        2
-#define SEM_TABULEIRO    3
-#define NUM_SEMS         4
+#define SEM_JOGADA       0
+#define SEM_MUTEX        1
+#define SEM_VEZ_J1       2
+#define SEM_VEZ_J2       3
+#define SEM_INICIO       4
+#define NUM_SEMS         5
 
 #define RESULTADO_NENHUM 0
 #define RESULTADO_J1     1
 #define RESULTADO_J2     2
 #define RESULTADO_EMPATE 3
-
-#define JOGADA_NONE      -1
 
 typedef struct {
     char tabuleiro[BOARD_SIZE];
@@ -31,6 +30,7 @@ typedef struct {
     int  jogo_ativo;
     int  j1_pronto;
     int  j2_pronto;
+    int  turno;
 } EstadoJogo;
 
 static void sem_op_fn(int semid, int idx, int op) {
@@ -84,11 +84,12 @@ void modo_servidor() {
     if (e == (void *)-1) { perror("shmat"); exit(1); }
 
     memset(e->tabuleiro, ' ', BOARD_SIZE);
-    e->jogada    = JOGADA_NONE;
-    e->resultado = RESULTADO_NENHUM;
+    e->jogada     = -1;
+    e->resultado  = RESULTADO_NENHUM;
     e->jogo_ativo = 1;
     e->j1_pronto  = 0;
     e->j2_pronto  = 0;
+    e->turno      = 1;
 
     int semid = semget(SEM_KEY, NUM_SEMS, IPC_CREAT | IPC_EXCL | 0666);
     if (semid == -1) {
@@ -98,10 +99,11 @@ void modo_servidor() {
         if (semid == -1) { perror("semget"); exit(1); }
     }
 
-    semctl(semid, SEM_VEZ_J1,    SETVAL, 0);
-    semctl(semid, SEM_VEZ_J2,    SETVAL, 0);
-    semctl(semid, SEM_MUTEX,     SETVAL, 1);
-    semctl(semid, SEM_TABULEIRO, SETVAL, 0);
+    semctl(semid, SEM_JOGADA, SETVAL, 0);
+    semctl(semid, SEM_MUTEX,  SETVAL, 1);
+    semctl(semid, SEM_VEZ_J1, SETVAL, 0);
+    semctl(semid, SEM_VEZ_J2, SETVAL, 0);
+    semctl(semid, SEM_INICIO, SETVAL, 0);
 
     printf("=== SERVIDOR INICIADO ===\n");
     printf("Aguardando Jogador 1 e Jogador 2 conectarem...\n");
@@ -110,32 +112,30 @@ void modo_servidor() {
     while (!(e->j1_pronto && e->j2_pronto))
         usleep(100000);
 
-    printf("Ambos os jogadores conectados! Iniciando jogo.\n\n");
+    printf("Ambos conectados! Iniciando jogo.\n");
     imprimir_tabuleiro(e->tabuleiro);
+    fflush(stdout);
 
-    semctl(semid, SEM_VEZ_J1, SETVAL, 1);
+    /* Libera os dois jogadores da barreira de inicio */
+    SEM_POST(semid, SEM_INICIO);
+    SEM_POST(semid, SEM_INICIO);
 
-    int turno = 1;
+    /* Libera apenas o jogador 1 para jogar */
+    SEM_POST(semid, SEM_VEZ_J1);
 
     while (e->jogo_ativo) {
-        int sem_espera  = (turno == 1) ? SEM_VEZ_J2 : SEM_VEZ_J1;
+        SEM_WAIT(semid, SEM_JOGADA);
 
-        SEM_WAIT(semid, sem_espera);
+        int  pos   = e->jogada;
+        int  turno = e->turno;
+        char simb  = (turno == 1) ? 'X' : 'O';
 
-        if (!e->jogo_ativo) break;
-
-        SEM_WAIT(semid, SEM_MUTEX);
-        int  pos  = e->jogada;
-        char simb = (turno == 1) ? 'X' : 'O';
         e->tabuleiro[pos] = simb;
-        e->jogada = JOGADA_NONE;
-        SEM_POST(semid, SEM_MUTEX);
+        e->jogada = -1;
 
         printf("\n[Jogador %d (%c)] jogou na posicao %d\n", turno, simb, pos);
         imprimir_tabuleiro(e->tabuleiro);
         fflush(stdout);
-
-        SEM_POST(semid, SEM_TABULEIRO);
 
         if (verificar_vitoria(e->tabuleiro, simb)) {
             e->resultado  = (turno == 1) ? RESULTADO_J1 : RESULTADO_J2;
@@ -151,8 +151,8 @@ void modo_servidor() {
             break;
         }
 
-        turno = (turno == 1) ? 2 : 1;
-        SEM_POST(semid, (turno == 1) ? SEM_VEZ_J1 : SEM_VEZ_J2);
+        e->turno = (turno == 1) ? 2 : 1;
+        SEM_POST(semid, (e->turno == 1) ? SEM_VEZ_J1 : SEM_VEZ_J2);
     }
 
     printf("===============================\n");
@@ -164,7 +164,6 @@ void modo_servidor() {
     printf("===============================\n");
 
     sleep(2);
-
     shmdt(e);
     shmctl(shm_id, IPC_RMID, NULL);
     semctl(semid, 0, IPC_RMID);
@@ -183,7 +182,8 @@ void modo_jogador(int num_jogador) {
     int semid = semget(SEM_KEY, NUM_SEMS, 0666);
     if (semid == -1) { perror("semget"); exit(1); }
 
-    char simbolo = (num_jogador == 1) ? 'X' : 'O';
+    char simbolo      = (num_jogador == 1) ? 'X' : 'O';
+    int sem_minha_vez = (num_jogador == 1) ? SEM_VEZ_J1 : SEM_VEZ_J2;
 
     SEM_WAIT(semid, SEM_MUTEX);
     if (num_jogador == 1) e->j1_pronto = 1;
@@ -194,16 +194,14 @@ void modo_jogador(int num_jogador) {
     printf("Aguardando o outro jogador...\n");
     fflush(stdout);
 
-    while (!(e->j1_pronto && e->j2_pronto))
-        usleep(100000);
+    /* Barreira: aguarda o servidor liberar o inicio */
+    SEM_WAIT(semid, SEM_INICIO);
 
     printf("Jogo iniciado!\n");
     imprimir_tabuleiro(e->tabuleiro);
+    fflush(stdout);
 
-    int sem_minha_vez = (num_jogador == 1) ? SEM_VEZ_J1 : SEM_VEZ_J2;
-    int sem_aviso     = (num_jogador == 1) ? SEM_VEZ_J2 : SEM_VEZ_J1;
-
-    while (e->jogo_ativo) {
+    while (1) {
         SEM_WAIT(semid, sem_minha_vez);
 
         if (!e->jogo_ativo) break;
@@ -225,10 +223,7 @@ void modo_jogador(int num_jogador) {
                 fflush(stdout);
                 continue;
             }
-            SEM_WAIT(semid, SEM_MUTEX);
-            int livre = (e->tabuleiro[pos] == ' ');
-            SEM_POST(semid, SEM_MUTEX);
-            if (!livre) {
+            if (e->tabuleiro[pos] != ' ') {
                 printf("Posicao ocupada. Escolha outra: ");
                 fflush(stdout);
                 continue;
@@ -240,17 +235,15 @@ void modo_jogador(int num_jogador) {
         e->jogada = pos;
         SEM_POST(semid, SEM_MUTEX);
 
-        SEM_POST(semid, sem_aviso);
+        SEM_POST(semid, SEM_JOGADA);
 
-        if (!e->jogo_ativo) break;
-
-        printf("Aguardando o outro jogador...\n");
-        fflush(stdout);
-
-        SEM_WAIT(semid, SEM_TABULEIRO);
-        imprimir_tabuleiro(e->tabuleiro);
+        if (e->jogo_ativo) {
+            printf("Aguardando o outro jogador...\n");
+            fflush(stdout);
+        }
     }
 
+    imprimir_tabuleiro(e->tabuleiro);
     printf("===============================\n");
     switch (e->resultado) {
         case RESULTADO_J1:     printf("  Jogador 1 (X) VENCEU!\n"); break;
