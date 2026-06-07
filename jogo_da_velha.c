@@ -2,28 +2,36 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
-#include <sys/sem.h>
 
 #define BOARD_SIZE       9
 #define SHM_KEY          0x1234
-#define SEM_KEY          0x5678
-
-#define SEM_JOGADA       0
-#define SEM_MUTEX        1
-#define SEM_VEZ_J1       2
-#define SEM_VEZ_J2       3
-#define SEM_INICIO       4
-#define NUM_SEMS         5
 
 #define RESULTADO_NENHUM 0
 #define RESULTADO_J1     1
 #define RESULTADO_J2     2
 #define RESULTADO_EMPATE 3
 
+/*
+ * Toda a sincronizacao e feita com mutex + variaveis de condicao POSIX
+ * armazenados na propria memoria compartilhada.
+ * Os atributos de processo-compartilhado (PTHREAD_PROCESS_SHARED) permitem
+ * que processos distintos usem os mesmos primitivos.
+ */
+ 
 typedef struct {
+    // primitivos de sincronizacao
+    pthread_mutex_t mutex;
+
+    pthread_cond_t  cond_inicio;
+    pthread_cond_t  cond_jogada;
+    pthread_cond_t  cond_vez_j1;
+    pthread_cond_t  cond_vez_j2;
+
+    // estado do jogo
     char tabuleiro[BOARD_SIZE];
     int  jogada;
     int  resultado;
@@ -31,17 +39,15 @@ typedef struct {
     int  j1_pronto;
     int  j2_pronto;
     int  turno;
+
+    // flags de notificacao
+    int  flag_inicio;
+    int  flag_jogada;
+    int  flag_vez_j1;
+    int  flag_vez_j2;
 } EstadoJogo;
 
-static void sem_op_fn(int semid, int idx, int op) {
-    struct sembuf sb = { (unsigned short)idx, (short)op, 0 };
-    if (semop(semid, &sb, 1) == -1) {
-        perror("semop");
-        exit(1);
-    }
-}
-#define SEM_WAIT(id, idx) sem_op_fn((id), (idx), -1)
-#define SEM_POST(id, idx) sem_op_fn((id), (idx),  1)
+// Utilitarios de tabuleiro
 
 void imprimir_tabuleiro(const char *t) {
     printf("\n");
@@ -71,9 +77,39 @@ int tabuleiro_cheio(const char *t) {
     return 1;
 }
 
-void modo_servidor() {
+//  Inicializa mutex e variaveis de condicao com atributo SHARED
+static void init_sync(EstadoJogo *e) {
+    pthread_mutexattr_t mattr;
+    pthread_condattr_t  cattr;
+
+    pthread_mutexattr_init(&mattr);
+    pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&e->mutex, &mattr);
+    pthread_mutexattr_destroy(&mattr);
+
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
+    pthread_cond_init(&e->cond_inicio,  &cattr);
+    pthread_cond_init(&e->cond_jogada,  &cattr);
+    pthread_cond_init(&e->cond_vez_j1,  &cattr);
+    pthread_cond_init(&e->cond_vez_j2,  &cattr);
+    pthread_condattr_destroy(&cattr);
+}
+
+static void destroy_sync(EstadoJogo *e) {
+    pthread_mutex_destroy(&e->mutex);
+    pthread_cond_destroy(&e->cond_inicio);
+    pthread_cond_destroy(&e->cond_jogada);
+    pthread_cond_destroy(&e->cond_vez_j1);
+    pthread_cond_destroy(&e->cond_vez_j2);
+}
+
+//  Modo servidor
+void modo_servidor(void) {
+    // Cria (ou recria) o segmento de memoria compartilhada
     int shm_id = shmget(SHM_KEY, sizeof(EstadoJogo), IPC_CREAT | IPC_EXCL | 0666);
     if (shm_id == -1) {
+        // Ja existia: remove e recria
         shm_id = shmget(SHM_KEY, sizeof(EstadoJogo), 0666);
         if (shm_id != -1) shmctl(shm_id, IPC_RMID, NULL);
         shm_id = shmget(SHM_KEY, sizeof(EstadoJogo), IPC_CREAT | IPC_EXCL | 0666);
@@ -83,60 +119,69 @@ void modo_servidor() {
     EstadoJogo *e = (EstadoJogo *)shmat(shm_id, NULL, 0);
     if (e == (void *)-1) { perror("shmat"); exit(1); }
 
+    // Inicializa estado
     memset(e->tabuleiro, ' ', BOARD_SIZE);
-    e->jogada     = -1;
-    e->resultado  = RESULTADO_NENHUM;
-    e->jogo_ativo = 1;
-    e->j1_pronto  = 0;
-    e->j2_pronto  = 0;
-    e->turno      = 1;
+    e->jogada      = -1;
+    e->resultado   = RESULTADO_NENHUM;
+    e->jogo_ativo  = 1;
+    e->j1_pronto   = 0;
+    e->j2_pronto   = 0;
+    e->turno       = 1;
+    e->flag_inicio = 0;
+    e->flag_jogada = 0;
+    e->flag_vez_j1 = 0;
+    e->flag_vez_j2 = 0;
 
-    int semid = semget(SEM_KEY, NUM_SEMS, IPC_CREAT | IPC_EXCL | 0666);
-    if (semid == -1) {
-        semid = semget(SEM_KEY, NUM_SEMS, 0666);
-        if (semid != -1) semctl(semid, 0, IPC_RMID);
-        semid = semget(SEM_KEY, NUM_SEMS, IPC_CREAT | IPC_EXCL | 0666);
-        if (semid == -1) { perror("semget"); exit(1); }
-    }
-
-    semctl(semid, SEM_JOGADA, SETVAL, 0);
-    semctl(semid, SEM_MUTEX,  SETVAL, 1);
-    semctl(semid, SEM_VEZ_J1, SETVAL, 0);
-    semctl(semid, SEM_VEZ_J2, SETVAL, 0);
-    semctl(semid, SEM_INICIO, SETVAL, 0);
+    init_sync(e);
 
     printf("SERVIDOR INICIADO\n");
     printf("Aguardando Jogador 1 e Jogador 2 conectarem...\n");
     fflush(stdout);
 
+    // Aguarda ambos os jogadores sinalizarem que estao prontos
+    pthread_mutex_lock(&e->mutex);
     while (!(e->j1_pronto && e->j2_pronto))
-        usleep(100000);
+        pthread_cond_wait(&e->cond_inicio, &e->mutex);
+    pthread_mutex_unlock(&e->mutex);
 
     printf("Ambos conectados! Iniciando jogo.\n");
     imprimir_tabuleiro(e->tabuleiro);
     fflush(stdout);
 
-    /* Libera os dois jogadores da barreira de inicio */
-    SEM_POST(semid, SEM_INICIO);
-    SEM_POST(semid, SEM_INICIO);
+    // Libera a barreira de inicio para ambos os jogadores
+    pthread_mutex_lock(&e->mutex);
+    e->flag_inicio = 2;          // dois jogadores aguardam
+    pthread_cond_broadcast(&e->cond_inicio);
 
-    /* Libera apenas o jogador 1 para jogar */
-    SEM_POST(semid, SEM_VEZ_J1);
+    // Libera o jogador 1 para jogar
+    e->flag_vez_j1 = 1;
+    pthread_cond_signal(&e->cond_vez_j1);
+    pthread_mutex_unlock(&e->mutex);
 
+    // Loop principal do servidor
     while (e->jogo_ativo) {
-        SEM_WAIT(semid, SEM_JOGADA);
+        // Aguarda uma jogada
+        pthread_mutex_lock(&e->mutex);
+        while (!e->flag_jogada)
+            pthread_cond_wait(&e->cond_jogada, &e->mutex);
+        e->flag_jogada = 0;
 
         int  pos   = e->jogada;
         int  turno = e->turno;
-        char simb  = (turno == 1) ? 'X' : 'O';
+        pthread_mutex_unlock(&e->mutex);
 
+        char simb = (turno == 1) ? 'X' : 'O';
+
+        pthread_mutex_lock(&e->mutex);
         e->tabuleiro[pos] = simb;
         e->jogada = -1;
+        pthread_mutex_unlock(&e->mutex);
 
         printf("\n[Jogador %d (%c)] jogou na posicao %d\n", turno, simb, pos);
         imprimir_tabuleiro(e->tabuleiro);
         fflush(stdout);
 
+        pthread_mutex_lock(&e->mutex);
         if (verificar_vitoria(e->tabuleiro, simb)) {
             e->resultado  = (turno == 1) ? RESULTADO_J1 : RESULTADO_J2;
             e->jogo_ativo = 0;
@@ -146,13 +191,25 @@ void modo_servidor() {
         }
 
         if (!e->jogo_ativo) {
-            SEM_POST(semid, SEM_VEZ_J1);
-            SEM_POST(semid, SEM_VEZ_J2);
+            // Acorda ambos para que leiam o resultado final
+            e->flag_vez_j1 = 1;
+            e->flag_vez_j2 = 1;
+            pthread_cond_signal(&e->cond_vez_j1);
+            pthread_cond_signal(&e->cond_vez_j2);
+            pthread_mutex_unlock(&e->mutex);
             break;
         }
 
+        // Passa a vez para o proximo jogador
         e->turno = (turno == 1) ? 2 : 1;
-        SEM_POST(semid, (e->turno == 1) ? SEM_VEZ_J1 : SEM_VEZ_J2);
+        if (e->turno == 1) {
+            e->flag_vez_j1 = 1;
+            pthread_cond_signal(&e->cond_vez_j1);
+        } else {
+            e->flag_vez_j2 = 1;
+            pthread_cond_signal(&e->cond_vez_j2);
+        }
+        pthread_mutex_unlock(&e->mutex);
     }
 
     printf("\n");
@@ -164,11 +221,12 @@ void modo_servidor() {
     printf("\n");
 
     sleep(2);
+    destroy_sync(e);
     shmdt(e);
     shmctl(shm_id, IPC_RMID, NULL);
-    semctl(semid, 0, IPC_RMID);
 }
 
+//  Modo jogador
 void modo_jogador(int num_jogador) {
     int shm_id = shmget(SHM_KEY, sizeof(EstadoJogo), 0666);
     if (shm_id == -1) {
@@ -179,30 +237,44 @@ void modo_jogador(int num_jogador) {
     EstadoJogo *e = (EstadoJogo *)shmat(shm_id, NULL, 0);
     if (e == (void *)-1) { perror("shmat"); exit(1); }
 
-    int semid = semget(SEM_KEY, NUM_SEMS, 0666);
-    if (semid == -1) { perror("semget"); exit(1); }
+    char simbolo = (num_jogador == 1) ? 'X' : 'O';
 
-    char simbolo      = (num_jogador == 1) ? 'X' : 'O';
-    int sem_minha_vez = (num_jogador == 1) ? SEM_VEZ_J1 : SEM_VEZ_J2;
-
-    SEM_WAIT(semid, SEM_MUTEX);
+    // Sinaliza ao servidor que este jogador esta pronto
+    pthread_mutex_lock(&e->mutex);
     if (num_jogador == 1) e->j1_pronto = 1;
     else                  e->j2_pronto = 1;
-    SEM_POST(semid, SEM_MUTEX);
+    pthread_cond_signal(&e->cond_inicio);   // notifica o servidor
+    pthread_mutex_unlock(&e->mutex);
 
     printf("Jogador %d (%c) conectado\n", num_jogador, simbolo);
     printf("Aguardando o outro jogador...\n");
     fflush(stdout);
 
-    /* Barreira: aguarda o servidor liberar o inicio */
-    SEM_WAIT(semid, SEM_INICIO);
+    // Barreira: aguarda o servidor sinalizar o inicio
+    pthread_mutex_lock(&e->mutex);
+    while (e->flag_inicio == 0)
+        pthread_cond_wait(&e->cond_inicio, &e->mutex);
+    e->flag_inicio--;   // consome um "ticket" de inicio
+    pthread_mutex_unlock(&e->mutex);
 
     printf("Jogo iniciado!\n");
     imprimir_tabuleiro(e->tabuleiro);
     fflush(stdout);
 
+    pthread_cond_t *minha_cond = (num_jogador == 1)
+                                 ? &e->cond_vez_j1
+                                 : &e->cond_vez_j2;
+    int *minha_flag = (num_jogador == 1)
+                      ? &e->flag_vez_j1
+                      : &e->flag_vez_j2;
+
     while (1) {
-        SEM_WAIT(semid, sem_minha_vez);
+        // Aguarda ser notificado de que e minha vez
+        pthread_mutex_lock(&e->mutex);
+        while (!(*minha_flag))
+            pthread_cond_wait(minha_cond, &e->mutex);
+        (*minha_flag) = 0;
+        pthread_mutex_unlock(&e->mutex);
 
         if (!e->jogo_ativo) break;
 
@@ -223,7 +295,10 @@ void modo_jogador(int num_jogador) {
                 fflush(stdout);
                 continue;
             }
-            if (e->tabuleiro[pos] != ' ') {
+            pthread_mutex_lock(&e->mutex);
+            int ocupada = (e->tabuleiro[pos] != ' ');
+            pthread_mutex_unlock(&e->mutex);
+            if (ocupada) {
                 printf("Posicao ocupada. Escolha outra: ");
                 fflush(stdout);
                 continue;
@@ -231,11 +306,12 @@ void modo_jogador(int num_jogador) {
             break;
         }
 
-        SEM_WAIT(semid, SEM_MUTEX);
-        e->jogada = pos;
-        SEM_POST(semid, SEM_MUTEX);
-
-        SEM_POST(semid, SEM_JOGADA);
+        // Registra a jogada e notifica o servidor
+        pthread_mutex_lock(&e->mutex);
+        e->jogada      = pos;
+        e->flag_jogada = 1;
+        pthread_cond_signal(&e->cond_jogada);
+        pthread_mutex_unlock(&e->mutex);
 
         if (e->jogo_ativo) {
             printf("Aguardando o outro jogador...\n");
@@ -256,15 +332,16 @@ void modo_jogador(int num_jogador) {
 }
 
 /*
-COMO RODAR:
+COMO COMPILAR E RODAR:
 
-gcc -o jogo jogo_da_velha.c
-./jogo servidor
-./jogo jogador 1
-./jogo jogador 2
+  gcc -o jogo jogo_da_velha.c -lpthread
 
-CASO QUEIRA LIMPAR OS SEMÁFOROS E MEMÓRIA COMPARTILHADA APÓS O JOGO, RODE:
-ipcrm -M 0x1234; ipcrm -S 0x5678
+  Terminal 1 (servidor): ./jogo servidor
+  Terminal 2 (jogador1): ./jogo jogador 1
+  Terminal 3 (jogador2): ./jogo jogador 2
+
+CASO PRECISE LIMPAR A MEMORIA COMPARTILHADA MANUALMENTE:
+  ipcrm -M 0x1234
 */
 
 int main(int argc, char *argv[]) {
