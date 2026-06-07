@@ -16,14 +16,12 @@
 #define RESULTADO_EMPATE 3
 
 /*
- * Toda a sincronizacao e feita com mutex + variaveis de condicao POSIX
- * armazenados na propria memoria compartilhada.
- * Os atributos de processo-compartilhado (PTHREAD_PROCESS_SHARED) permitem
- * que processos distintos usem os mesmos primitivos.
+ * A sincronizacao entre os processos e feita com mutex e variaveis de
+ * condicao, ambos guardados na memoria compartilhada para que o servidor
+ * e os dois jogadores possam usa-los juntos.
  */
  
 typedef struct {
-    // primitivos de sincronizacao
     pthread_mutex_t mutex;
 
     pthread_cond_t  cond_inicio;
@@ -31,7 +29,6 @@ typedef struct {
     pthread_cond_t  cond_vez_j1;
     pthread_cond_t  cond_vez_j2;
 
-    // estado do jogo
     char tabuleiro[BOARD_SIZE];
     int  jogada;
     int  resultado;
@@ -40,14 +37,12 @@ typedef struct {
     int  j2_pronto;
     int  turno;
 
-    // flags de notificacao
     int  flag_inicio;
     int  flag_jogada;
     int  flag_vez_j1;
     int  flag_vez_j2;
 } EstadoJogo;
 
-// Utilitarios de tabuleiro
 
 void imprimir_tabuleiro(const char *t) {
     printf("\n");
@@ -77,7 +72,6 @@ int tabuleiro_cheio(const char *t) {
     return 1;
 }
 
-//  Inicializa mutex e variaveis de condicao com atributo SHARED
 static void init_sync(EstadoJogo *e) {
     pthread_mutexattr_t mattr;
     pthread_condattr_t  cattr;
@@ -109,7 +103,6 @@ void modo_servidor(void) {
     // Cria (ou recria) o segmento de memoria compartilhada
     int shm_id = shmget(SHM_KEY, sizeof(EstadoJogo), IPC_CREAT | IPC_EXCL | 0666);
     if (shm_id == -1) {
-        // Ja existia: remove e recria
         shm_id = shmget(SHM_KEY, sizeof(EstadoJogo), 0666);
         if (shm_id != -1) shmctl(shm_id, IPC_RMID, NULL);
         shm_id = shmget(SHM_KEY, sizeof(EstadoJogo), IPC_CREAT | IPC_EXCL | 0666);
@@ -158,7 +151,6 @@ void modo_servidor(void) {
     pthread_cond_signal(&e->cond_vez_j1);
     pthread_mutex_unlock(&e->mutex);
 
-    // Loop principal do servidor
     while (e->jogo_ativo) {
         // Aguarda uma jogada
         pthread_mutex_lock(&e->mutex);
@@ -269,7 +261,6 @@ void modo_jogador(int num_jogador) {
                       : &e->flag_vez_j2;
 
     while (1) {
-        // Aguarda ser notificado de que e minha vez
         pthread_mutex_lock(&e->mutex);
         while (!(*minha_flag))
             pthread_cond_wait(minha_cond, &e->mutex);
@@ -306,7 +297,6 @@ void modo_jogador(int num_jogador) {
             break;
         }
 
-        // Registra a jogada e notifica o servidor
         pthread_mutex_lock(&e->mutex);
         e->jogada      = pos;
         e->flag_jogada = 1;
